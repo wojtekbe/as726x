@@ -23,6 +23,7 @@
 #include <linux/err.h>
 #include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 
 #include <linux/gpio.h>
 
@@ -48,9 +49,13 @@
 #define AS726X_VREG_CALIB_DATA    0x14
 
 struct as726x_data {
-	struct i2c_client	*client;
-	struct attribute_group	attrs;
-	struct mutex		lock;
+	struct i2c_client *client;
+	struct attribute_group attrs;
+	struct mutex lock;
+	struct delayed_work work;
+	int channel_results_calib[6]; /* float */
+	u16 channel_results_raw[6];
+	int int_time; /* [ms] */
 };
 
 static int as726x_write_vreg(struct i2c_client *client,
@@ -80,6 +85,13 @@ static int as726x_write_vreg(struct i2c_client *client,
 	return 0;
 }
 
+static void as726x_reset(struct i2c_client *c)
+{
+	printk("reset\n");
+	as726x_write_vreg(c, AS726X_VREG_CONTROL_SETUP, 0x80);
+	msleep(800);
+}
+
 static int as726x_read_vreg(struct i2c_client *client,
 			     u8 reg, u8 *val)
 {
@@ -88,27 +100,69 @@ static int as726x_read_vreg(struct i2c_client *client,
 
 	while (1) {
 		stat = i2c_smbus_read_byte_data(client, AS726X_STATUS_REG);
-		if((stat > 0 ) && ((stat & AS726X_TX_VALID) == 0))
+		if (stat < 0)
+			goto err;
+		if((stat & AS726X_TX_VALID) == 0)
 			break;
 		msleep(50);
 	}
 	ret = i2c_smbus_write_byte_data(client, AS726X_WRITE_REG, reg);
 	if (ret < 0)
-		return ret;
+		goto err;
 
 	while (1) {
 		stat = i2c_smbus_read_byte_data(client, AS726X_STATUS_REG);
-		if((stat > 0 ) && ((stat & AS726X_TX_VALID) == 0))
+		if (stat < 0)
+			goto err;
+		if((stat & AS726X_TX_VALID) == 0)
 			break;
 		msleep(50);
 	}
 	ret = i2c_smbus_read_byte_data(client, AS726X_READ_REG);
 	if (ret < 0)
-		return ret;
+		goto err;
 
 	*val = (u8)ret;
 
 	return 0;
+
+err:
+	printk("Failed reading vreg\n");
+	return -1;
+}
+
+static void as726x_workfunc(struct work_struct *w)
+{
+	struct as726x_data *data = container_of((struct delayed_work *)w,
+			struct as726x_data, work);
+	int ch, i;
+	u8 v;
+
+	/* read calibrated data */
+	for (ch=0; ch<6; ch++) {
+		data->channel_results_calib[ch] = 0;
+		for (i=0; i<4; i++) {
+			as726x_read_vreg(data->client,
+				AS726X_VREG_CALIB_DATA+(4*ch)+i, &v);
+			data->channel_results_calib[ch] |= (v << (24-(i*8)));
+		}
+		//printk("%d calib -> 0x%08x\n", ch, data->channel_results_calib[ch]);
+	}
+	//printk("\n");
+
+	/* read raw data */
+	for (ch=0; ch<6; ch++) {
+		data->channel_results_raw[ch] = 0;
+		for (i=0; i<2; i++) {
+			as726x_read_vreg(data->client,
+				AS726X_VREG_RAW_DATA+(2*ch)+i, &v);
+			data->channel_results_raw[ch] |= (v << (8-(i*8)));
+		}
+		//printk("%d -> 0x%04x\n", ch, data->channel_results_raw[ch]);
+	}
+	//printk("\n");
+
+	schedule_delayed_work(&data->work, msecs_to_jiffies(data->int_time*2*10));
 }
 
 static int as726x_read_raw_data(struct i2c_client *client, int ch)
@@ -130,6 +184,7 @@ static int as726x_read_raw_data(struct i2c_client *client, int ch)
 	return data;
 }
 
+#if 0
 static int as726x_read_calib_data(struct i2c_client *client, int ch)
 {
 	u8 v, c;
@@ -162,7 +217,7 @@ static int as726x_read_calib_data(struct i2c_client *client, int ch)
 			goto err;
 		if (c & 0x02)
 			break;
-		msleep(300);
+		msleep(200);
 		cnt++;
 	}
 
@@ -181,12 +236,10 @@ static int as726x_read_calib_data(struct i2c_client *client, int ch)
 
 err:
 	printk("Failed reading data\n");
-	/* reset */
-	v |= (0x1 << 7);
-	as726x_write_vreg(client, AS726X_VREG_CONTROL_SETUP, v);
-	msleep(800);
+	as726x_reset(client);
 	return -1;
 }
+#endif
 
 static int as726x_read_raw(struct iio_dev *indio_dev,
 			   struct iio_chan_spec const *chan,
@@ -196,21 +249,31 @@ static int as726x_read_raw(struct iio_dev *indio_dev,
 	struct as726x_data *data = iio_priv(indio_dev);
 	struct i2c_client *client = data->client;
 
-	*val = as726x_read_calib_data(client, chan->address);
+	if (mask == 0)
+		*val = data->channel_results_raw[chan->address];
 
-	printk("read: %li -> 0x%08x\n", chan->address, *val);
+	if (mask == 1)
+		*val = data->channel_results_calib[chan->address];
 
 	return IIO_VAL_INT;
 }
 
-#define AS726X_CHANNEL(index)							\
-	{													\
-		.type = IIO_INTENSITY,							\
-		.channel = index,								\
-		.modified = 0,									\
-		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),	\
-		.address = index,								\
-		.indexed = 1,									\
+#define AS726X_CHANNEL(index)                               \
+	{                                                       \
+		.type = IIO_INTENSITY,                              \
+		.channel = index,                                   \
+		.modified = 0,                                      \
+		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),       \
+		.address = index,                                   \
+		.indexed = 1,                                       \
+	},                                                      \
+	{                                                       \
+		.type = IIO_INTENSITY,                              \
+		.channel = index,                                   \
+		.modified = 0,                                      \
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED), \
+		.address = index,                                   \
+		.indexed = 1,                                       \
 	}
 
 static const struct iio_chan_spec as726x_channels[] = {
@@ -232,8 +295,6 @@ static int as726x_probe(struct i2c_client *client,
 	u16 hw_version = 0;
 	u8 v = 0;
 
-	printk("probe\n");
-
 	/* Register with IIO */
 	indio_dev = iio_device_alloc(sizeof(*data));
 	if (indio_dev == NULL) {
@@ -243,6 +304,7 @@ static int as726x_probe(struct i2c_client *client,
 	i2c_set_clientdata(client, indio_dev);
 
 	data->client = client;
+	data->int_time = 50;
 	mutex_init(&data->lock);
 	indio_dev->dev.parent = &client->dev;
 	indio_dev->channels = as726x_channels;
@@ -257,9 +319,7 @@ static int as726x_probe(struct i2c_client *client,
 	printk("Found AS726X sensor (hw_ver 0x%02x)\n", hw_version);
 
 	/* reset */
-	v |= (0x1 << 7);
-	as726x_write_vreg(client, AS726X_VREG_CONTROL_SETUP, v);
-	msleep(800);
+	as726x_reset(client);
 
 	/* led control */
 	v = 0x00 | (0x3 << 4); /* current limit 100mA */
@@ -268,21 +328,23 @@ static int as726x_probe(struct i2c_client *client,
 	printk("led_cfg = 0x%x\n", v);
 
 	/* integration time x*2.8ms */
-	as726x_write_vreg(client, AS726X_VREG_INT_T, 50);
-	//msleep(300);
+	as726x_write_vreg(client, AS726X_VREG_INT_T, data->int_time);
 	as726x_read_vreg(client, AS726X_VREG_INT_T, &v);
 	printk("int_t = 0x%x\n", v);
 
 	/* control setup */
-	v = 0x08 | (0x3 << 4); /* GAIN 64x */
+	v = 0x08 | (0x11 << 4); /* GAIN 64x , Mode = 2 */
 	as726x_write_vreg(client, AS726X_VREG_CONTROL_SETUP, v);
 	as726x_read_vreg(client, AS726X_VREG_CONTROL_SETUP, &v);
 	printk("control_setup = 0x%x\n", v);
 
-
 	err = iio_device_register(indio_dev);
 	if (err < 0)
 		goto exit_free_iio;
+
+	INIT_DELAYED_WORK(&data->work, as726x_workfunc);
+	schedule_delayed_work(&data->work,
+		msecs_to_jiffies(data->int_time*2));
 
 	return 0;
 
@@ -295,6 +357,8 @@ static int as726x_remove(struct i2c_client *client)
 {
 	struct iio_dev *indio_dev = i2c_get_clientdata(client);
 	struct as726x_data *data = iio_priv(indio_dev);
+
+	cancel_delayed_work(&data->work);
 
 	iio_device_unregister(indio_dev);
 
