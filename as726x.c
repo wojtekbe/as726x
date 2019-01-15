@@ -138,17 +138,22 @@ static void as726x_workfunc(struct work_struct *w)
 	int ch, i;
 	u8 v;
 
+	/* read temp */
+	as726x_read_vreg(data->client, AS726X_VREG_DEVICE_TEMP, &v);
+	printk("temp: %d\n", v);
+
 	/* read calibrated data */
 	for (ch=0; ch<6; ch++) {
 		data->channel_results_calib[ch] = 0;
 		for (i=0; i<4; i++) {
 			as726x_read_vreg(data->client,
 				AS726X_VREG_CALIB_DATA+(4*ch)+i, &v);
-			data->channel_results_calib[ch] |= (v << (24-(i*8)));
+			//data->channel_results_calib[ch] |= (v << (24-(i*8)));
+			data->channel_results_calib[ch] |= (v << (i*8));
 		}
-		//printk("%d calib -> 0x%08x\n", ch, data->channel_results_calib[ch]);
+		printk("%d calib -> 0x%08x\n", ch, data->channel_results_calib[ch]);
 	}
-	//printk("\n");
+	printk("\n");
 
 	/* read raw data */
 	for (ch=0; ch<6; ch++) {
@@ -158,9 +163,9 @@ static void as726x_workfunc(struct work_struct *w)
 				AS726X_VREG_RAW_DATA+(2*ch)+i, &v);
 			data->channel_results_raw[ch] |= (v << (8-(i*8)));
 		}
-		//printk("%d -> 0x%04x\n", ch, data->channel_results_raw[ch]);
+		printk("%d -> 0x%04x\n", ch, data->channel_results_raw[ch]);
 	}
-	//printk("\n");
+	printk("\n");
 
 	schedule_delayed_work(&data->work, msecs_to_jiffies(data->int_time*2*10));
 }
@@ -304,7 +309,7 @@ static int as726x_probe(struct i2c_client *client,
 	i2c_set_clientdata(client, indio_dev);
 
 	data->client = client;
-	data->int_time = 50;
+	data->int_time = 50; // [ms]
 	mutex_init(&data->lock);
 	indio_dev->dev.parent = &client->dev;
 	indio_dev->channels = as726x_channels;
